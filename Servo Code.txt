@@ -1,0 +1,481 @@
+// servo_control.c
+// Uses sysfs PWM: /sys/class/pwm/pwmchip0/pwm2 (your working setup)
+// Uses "Travel per µsec" (deg_per_us) to convert degrees <-> pulse width.
+// This is the right way to get consistent "45 degrees" behavior.
+//
+// Build:
+//   gcc servo_control.c -o servo_control -lm
+//
+// Before run (once per boot):
+//   sudo pinctrl set 18 a3
+//   echo 2 | sudo tee /sys/class/pwm/pwmchip0/export >/dev/null 2>&1 || true
+//
+// Run:
+//   sudo ./servo_control
+//
+// Optional sensor stop (sysfs GPIO):
+//   echo N | sudo tee /sys/class/gpio/export
+//   echo in | sudo tee /sys/class/gpio/gpioN/direction
+//   then:  sensor N
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <ctype.h>
+#include <errno.h>
+#include <math.h>
+#include <sys/stat.h>
+
+#define PWM_CHIP "/sys/class/pwm/pwmchip0"
+#define PWM_CH   "pwm2"
+#define PWM_DIR  PWM_CHIP "/" PWM_CH
+#define PWM_FILE(f) (PWM_DIR "/" f)
+
+static volatile sig_atomic_t stop_requested = 0;
+static volatile sig_atomic_t exiting = 0;
+
+static void sigint_handler(int s) {
+    (void)s;
+    stop_requested = 1;
+    exiting = 1;
+}
+
+static int path_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static int wait_for_path(const char *path, int timeout_ms) {
+    const int step = 10;
+    for (int t = 0; t < timeout_ms; t += step) {
+        if (path_exists(path)) return 0;
+        usleep(step * 1000);
+    }
+    return -1;
+}
+
+static int write_str(const char *path, const char *val) {
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "ERROR open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (fputs(val, f) == EOF) {
+        fprintf(stderr, "ERROR write %s: %s\n", path, strerror(errno));
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    return 0;
+}
+
+static int write_int(const char *path, long v) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%ld", v);
+    return write_str(path, buf);
+}
+
+static int read_int(const char *path, long *out) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    long v;
+    int ok = fscanf(f, "%ld", &v);
+    fclose(f);
+    if (ok != 1) return -1;
+    *out = v;
+    return 0;
+}
+
+static int ensure_pwm(void) {
+    if (!path_exists(PWM_DIR)) {
+        // export channel 2
+        if (write_str(PWM_CHIP "/export", "2") < 0) return -1;
+        if (wait_for_path(PWM_DIR, 500) < 0) {
+            fprintf(stderr, "ERROR: %s did not appear\n", PWM_DIR);
+            return -1;
+        }
+    }
+
+    // configure 50Hz
+    write_str(PWM_FILE("enable"), "0");
+    if (write_int(PWM_FILE("period"), 20000000) < 0) return -1;
+    if (write_int(PWM_FILE("duty_cycle"), 1500000) < 0) return -1;
+    if (write_str(PWM_FILE("enable"), "1") < 0) return -1;
+
+    long en = 0;
+    if (read_int(PWM_FILE("enable"), &en) < 0 || en != 1) {
+        fprintf(stderr, "ERROR: PWM enable not 1 (got %ld)\n", en);
+        return -1;
+    }
+    return 0;
+}
+
+static void pwm_off(void) {
+    write_str(PWM_FILE("enable"), "0");
+}
+
+static int set_pwm_duty_ns(long duty_ns) {
+    // clamp to 0..period-1 so kernel doesn't reject it
+    long period = 20000000;
+    (void)read_int(PWM_FILE("period"), &period);
+    if (duty_ns < 0) duty_ns = 0;
+    if (duty_ns >= period) duty_ns = period - 1;
+    return write_int(PWM_FILE("duty_cycle"), duty_ns);
+}
+
+// sysfs GPIO sensor read: /sys/class/gpio/gpioN/value
+static int read_gpio_value(int gpio, int *out) {
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", gpio);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int c = fgetc(f);
+    fclose(f);
+    if (c == '0') { *out = 0; return 0; }
+    if (c == '1') { *out = 1; return 0; }
+    return -1;
+}
+
+static double clampd(double x, double lo, double hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+// ----- Servo model (based on your spec) -----
+// We treat "mechanical degrees" as real degrees of rotation (0..360*rotations).
+// Pulse is computed by a linear model around center:
+//   pulse_us = center_us + (deg / deg_per_us)
+//
+// IMPORTANT: deg_per_us may not be exactly 0.90 for your unit. Use `scale` to calibrate.
+typedef struct {
+    double deg_per_us;     // default 0.90 (deg / microsecond)
+    double center_us;      // usually 1500
+    double pulse_us;       // current commanded pulse
+    double deg_pos;        // current "mechanical" deg estimate (based on pulse model)
+    double min_us;         // clamp (e.g. 500)
+    double max_us;         // clamp (e.g. 2500)
+} servo_t;
+
+static void servo_recalc_deg_from_pulse(servo_t *s) {
+    s->deg_pos = (s->pulse_us - s->center_us) * s->deg_per_us;
+}
+
+// Convert target mechanical degrees to pulse
+static double servo_deg_to_pulse_us(const servo_t *s, double deg) {
+    // deg_per_us = deg/us => us per deg = 1/deg_per_us
+    double delta_us = deg / s->deg_per_us;
+    return s->center_us + delta_us;
+}
+
+static int servo_set_pulse_us(servo_t *s, double pulse_us) {
+    pulse_us = clampd(pulse_us, s->min_us, s->max_us);
+    s->pulse_us = pulse_us;
+    servo_recalc_deg_from_pulse(s);
+    long duty_ns = (long) llround(pulse_us * 1000.0);
+    return set_pwm_duty_ns(duty_ns);
+}
+
+// Move smoothly from current pulse to target pulse over duration, with sensor/stop polling.
+static int servo_ramp_to_pulse(servo_t *s, double target_us, double duration_s,
+                              int sensor_gpio, int dt_ms)
+{
+    target_us = clampd(target_us, s->min_us, s->max_us);
+    if (duration_s <= 0.0) duration_s = 0.05;
+    if (dt_ms < 10) dt_ms = 10;
+
+    int steps = (int) ((duration_s * 1000.0) / dt_ms);
+    if (steps < 1) steps = 1;
+
+    double start = s->pulse_us;
+    for (int i = 0; i <= steps; i++) {
+        if (stop_requested) return -1;
+
+        double frac = (double)i / (double)steps;
+        double pu = start + frac * (target_us - start);
+
+        if (servo_set_pulse_us(s, pu) < 0) return -2;
+
+        if (sensor_gpio >= 0) {
+            int v;
+            if (read_gpio_value(sensor_gpio, &v) == 0 && v) return 1;
+        }
+
+        usleep(dt_ms * 1000);
+    }
+    return 0;
+}
+
+static int servo_hold(servo_t *s, double hold_s, int sensor_gpio) {
+    if (hold_s <= 0.0) return 0;
+    const int poll_ms = 50;
+    int loops = (int)((hold_s * 1000.0) / poll_ms);
+    if (loops < 1) loops = 1;
+
+    for (int i = 0; i < loops; i++) {
+        if (stop_requested) return -1;
+        (void)s;
+        if (sensor_gpio >= 0) {
+            int v;
+            if (read_gpio_value(sensor_gpio, &v) == 0 && v) return 1;
+        }
+        usleep(poll_ms * 1000);
+    }
+    return 0;
+}
+
+static void help(void) {
+    puts("Commands:");
+    puts("  status");
+    puts("  scale <deg_per_us>          (default 0.90; calibrate here)");
+    puts("  pulse <us>                  (direct pulse command)");
+    puts("  move <deg> <sec> [hold_s]   (relative move, ex: move 45 2 1)");
+    puts("  goto <deg> <sec> [hold_s]   (absolute mechanical deg, based on model)");
+    puts("  range <a> <b> <sec> [hold]  (sweep a->b then optional hold)");
+    puts("  search <a> <b> <sec>        (sweep and stop if sensor triggers)");
+    puts("  auto <mode> [rot] [sec/rot] [hold_s]");
+    puts("      mode 0=5deg, 1=15deg, 2=30deg, 3=45deg");
+    puts("      stops at each milestone and holds");
+    puts("  sensor <gpioN>              (sysfs gpio input; stops motion when reads 1)");
+    puts("  stop                        (immediate stop of motion)");
+    puts("  quit");
+}
+
+int main(void) {
+    signal(SIGINT, sigint_handler);
+
+    if (ensure_pwm() < 0) {
+        fprintf(stderr, "PWM init failed. Make sure PWM2 exists and GPIO18 set to PWM (sudo pinctrl set 18 a3).\n");
+        return 1;
+    }
+
+    servo_t s = {
+        .deg_per_us = 0.90,     // from your spec
+        .center_us  = 1500.0,
+        .pulse_us   = 1500.0,
+        .deg_pos    = 0.0,
+        .min_us     = 500.0,    // Max PWM Range 500-2500us
+        .max_us     = 2500.0
+    };
+
+    // Start centered
+    if (servo_set_pulse_us(&s, s.center_us) < 0) {
+        fprintf(stderr, "Failed to set initial pulse.\n");
+        return 1;
+    }
+    usleep(200000);
+
+    int sensor_gpio = -1;
+
+    puts("Ready. Type 'help' for commands.");
+    char line[256];
+
+    while (!exiting) {
+        printf("> ");
+        fflush(stdout);
+        if (!fgets(line, sizeof(line), stdin)) break;
+
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '\0') continue;
+
+        char cmd[32];
+        if (sscanf(p, "%31s", cmd) != 1) continue;
+
+        if (!strcmp(cmd, "help")) { help(); continue; }
+        if (!strcmp(cmd, "quit")) break;
+
+        if (!strcmp(cmd, "stop")) {
+            stop_requested = 1;
+            puts("Stop requested.");
+            continue;
+        }
+
+        if (!strcmp(cmd, "status")) {
+            printf("pulse_us=%.2f  deg_pos(model)=%.2f  deg_per_us=%.4f  center_us=%.1f  clamp=[%.0f..%.0f]  sensor=%d\n",
+                   s.pulse_us, s.deg_pos, s.deg_per_us, s.center_us, s.min_us, s.max_us, sensor_gpio);
+            continue;
+        }
+
+        if (!strcmp(cmd, "scale")) {
+            double v;
+            if (sscanf(p + 5, "%lf", &v) == 1 && v > 0.05 && v < 5.0) {
+                s.deg_per_us = v;
+                servo_recalc_deg_from_pulse(&s);
+                printf("deg_per_us set to %.4f\n", s.deg_per_us);
+            } else {
+                puts("Usage: scale <deg_per_us>  (example: scale 0.75)");
+            }
+            continue;
+        }
+
+        if (!strcmp(cmd, "sensor")) {
+            int g;
+            if (sscanf(p + 6, "%d", &g) == 1) {
+                sensor_gpio = g;
+                printf("Sensor set to gpio%d (sysfs). It must be exported and set as input.\n", g);
+            } else {
+                puts("Usage: sensor <gpioN>");
+            }
+            continue;
+        }
+
+        if (!strcmp(cmd, "pulse")) {
+            double us;
+            if (sscanf(p + 5, "%lf", &us) == 1) {
+                stop_requested = 0;
+                if (servo_set_pulse_us(&s, us) < 0) puts("Failed to set duty.");
+                else printf("Set pulse %.2f us (deg_pos model %.2f)\n", s.pulse_us, s.deg_pos);
+            } else {
+                puts("Usage: pulse <us>");
+            }
+            continue;
+        }
+
+        if (!strcmp(cmd, "move")) {
+            double deg, sec, hold_s = 0.0;
+            int n = sscanf(p + 4, "%lf %lf %lf", &deg, &sec, &hold_s);
+            if (n >= 2) {
+                stop_requested = 0;
+
+                // relative move: compute target pulse by delta
+                double delta_us = deg / s.deg_per_us;
+                double target = s.pulse_us + delta_us;
+
+                printf("Move %.2f deg -> delta %.2f us -> target %.2f us\n", deg, delta_us, target);
+
+                int rc = servo_ramp_to_pulse(&s, target, sec, sensor_gpio, 20);
+                if (rc == 1) puts("Stopped by sensor.");
+                else if (rc < 0) puts("Stopped.");
+                else {
+                    int hc = servo_hold(&s, hold_s, sensor_gpio);
+                    if (hc == 1) puts("Stopped by sensor during hold.");
+                }
+            } else {
+                puts("Usage: move <deg> <sec> [hold_s]");
+            }
+            continue;
+        }
+
+        if (!strcmp(cmd, "goto")) {
+            double deg, sec, hold_s = 0.0;
+            int n = sscanf(p + 4, "%lf %lf %lf", &deg, &sec, &hold_s);
+            if (n >= 2) {
+                stop_requested = 0;
+                double target = servo_deg_to_pulse_us(&s, deg);
+                printf("Goto %.2f deg -> target pulse %.2f us\n", deg, target);
+
+                int rc = servo_ramp_to_pulse(&s, target, sec, sensor_gpio, 20);
+                if (rc == 1) puts("Stopped by sensor.");
+                else if (rc < 0) puts("Stopped.");
+                else {
+                    int hc = servo_hold(&s, hold_s, sensor_gpio);
+                    if (hc == 1) puts("Stopped by sensor during hold.");
+                }
+            } else {
+                puts("Usage: goto <deg> <sec> [hold_s]");
+            }
+            continue;
+        }
+
+        if (!strcmp(cmd, "range") || !strcmp(cmd, "search")) {
+            double a, b, sec, hold_s = 0.0;
+            int is_search = (!strcmp(cmd, "search"));
+
+            int n = is_search
+                ? sscanf(p + 6, "%lf %lf %lf", &a, &b, &sec)
+                : sscanf(p + 5, "%lf %lf %lf %lf", &a, &b, &sec, &hold_s);
+
+            if ((is_search && n == 3) || (!is_search && n >= 3)) {
+                stop_requested = 0;
+                double pa = servo_deg_to_pulse_us(&s, a);
+                double pb = servo_deg_to_pulse_us(&s, b);
+
+                printf("%s %.2f->%.2f deg (pulse %.2f->%.2f us) over %.2fs\n",
+                       is_search ? "Search" : "Range", a, b, pa, pb, sec);
+
+                int rc = servo_ramp_to_pulse(&s, pa, 0.2, sensor_gpio, 20);
+                if (rc == 1) { puts("Sensor triggered (while moving to start)."); continue; }
+                if (rc < 0) { puts("Stopped."); continue; }
+
+                rc = servo_ramp_to_pulse(&s, pb, sec, sensor_gpio, 20);
+                if (rc == 1) puts("Sensor triggered (stopped).");
+                else if (rc < 0) puts("Stopped.");
+                else if (!is_search) {
+                    int hc = servo_hold(&s, hold_s, sensor_gpio);
+                    if (hc == 1) puts("Sensor triggered during hold.");
+                }
+            } else {
+                if (is_search) puts("Usage: search <start_deg> <end_deg> <sec>");
+                else puts("Usage: range <start_deg> <end_deg> <sec> [hold_s]");
+            }
+            continue;
+        }
+
+        if (!strcmp(cmd, "auto")) {
+            int mode = -1;
+            double rot = 1.0, sec_per_rot = 60.0, hold_s = 0.5;
+            int n = sscanf(p + 4, "%d %lf %lf %lf", &mode, &rot, &sec_per_rot, &hold_s);
+            if (n < 1) { puts("Usage: auto <mode 0..3> [rot] [sec/rot] [hold_s]"); continue; }
+            if (mode < 0 || mode > 3) { puts("Mode must be 0..3"); continue; }
+            if (rot <= 0.0) rot = 1.0;
+            if (sec_per_rot <= 0.0) sec_per_rot = 60.0;
+            if (hold_s < 0.0) hold_s = 0.0;
+
+            int step = (mode == 0) ? 5 : (mode == 1) ? 15 : (mode == 2) ? 30 : 45;
+            double total_deg = 360.0 * rot;
+            int num_steps = (int) llround(total_deg / step);
+            if (num_steps < 1) num_steps = 1;
+
+            // allocate motion time per step, with a hold at each milestone
+            double total_time = rot * sec_per_rot;
+            double per_step = total_time / num_steps;
+            double move_time = per_step - hold_s;
+            if (move_time < 0.05) move_time = 0.05;
+
+            printf("Auto mode %d: step=%ddeg rot=%.2f sec/rot=%.2f move/step=%.2fs hold=%.2fs\n",
+                   mode, step, rot, sec_per_rot, move_time, hold_s);
+
+            stop_requested = 0;
+
+            // start at 0 deg
+            double cur_deg = 0.0;
+            int rc = servo_ramp_to_pulse(&s, servo_deg_to_pulse_us(&s, 0.0), 0.5, sensor_gpio, 20);
+            if (rc == 1) { puts("Sensor triggered."); continue; }
+            if (rc < 0) { puts("Stopped."); continue; }
+
+            for (int k = 0; k <= num_steps && !stop_requested; k++) {
+                double target_deg = k * (double)step;
+                // keep it within 0..360 for the milestone display, but the pulse model is linear anyway
+                double shown = fmod(target_deg, 360.0);
+                if (shown < 0.0) shown += 360.0;
+
+                double target_pulse = servo_deg_to_pulse_us(&s, shown);
+
+                printf("  stop at %.0f deg -> pulse %.2f us\n", shown, clampd(target_pulse, s.min_us, s.max_us));
+
+                rc = servo_ramp_to_pulse(&s, target_pulse, move_time, sensor_gpio, 20);
+                if (rc == 1) { printf("Sensor triggered at %.0f deg\n", shown); break; }
+                if (rc < 0) { puts("Stopped."); break; }
+
+                rc = servo_hold(&s, hold_s, sensor_gpio);
+                if (rc == 1) { printf("Sensor triggered during hold at %.0f deg\n", shown); break; }
+                if (rc < 0) { puts("Stopped."); break; }
+
+                cur_deg = shown;
+            }
+
+            puts("Auto finished or stopped.");
+            continue;
+        }
+
+        puts("Unknown command. Type 'help'.");
+    }
+
+    puts("Exiting. Disabling PWM.");
+    pwm_off();
+    return 0;
+}
