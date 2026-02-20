@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+ONCE=0
+if [[ "${1:-}" == "--once" ]]; then
+  ONCE=1
+fi
 set -u
 
 # Config via environment variables (systemd Environment=...)
@@ -103,4 +107,7 @@ PY
   # 3) Log result
   echo "$TS,$CH,$MHZ,$AVG,$PEAK,$GAIN,$SCAN_SEC" >> "$LOG"
   echo "$TS  best_ch=$CH  freq=${MHZ}MHz  avg=${AVG}dB  peak=${PEAK}dB"
+  if [[ "$ONCE" -eq 1 ]]; then
+    break
+  fi
 done
