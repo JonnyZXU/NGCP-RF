@@ -354,14 +354,26 @@ int main(void) {
         .deg_pos   = 0.0,
         .min_us    = 500.0,
         .max_us    = 2500.0,
-        .cal_count = 5
+        .cal_count = 17
     };
 
-    s.cal[0] = (cal_point_t){   0.0, 1500.0 };
-    s.cal[1] = (cal_point_t){  90.0, 1750.0 };
-    s.cal[2] = (cal_point_t){ 180.0, 2000.0 };
-    s.cal[3] = (cal_point_t){ 270.0, 2250.0 };
-    s.cal[4] = (cal_point_t){ 360.0, 2500.0 };
+    s.cal[0] = (cal_point_t){   0.0, 1499.0 };
+    s.cal[1] = (cal_point_t){  45.0, 1546.0 };
+    s.cal[2] = (cal_point_t){  90.0, 1601.0 };
+    s.cal[3] = (cal_point_t){ 135.0, 1653.0 };
+    s.cal[4] = (cal_point_t){ 180.0, 1702.75 };
+    s.cal[5] = (cal_point_t){ 225.0, 1754.5 };
+    s.cal[6] = (cal_point_t){ 270.0, 1807.0 };
+    s.cal[7] = (cal_point_t){ 315.0, 1856.5 };
+    s.cal[8] = (cal_point_t){ 360.0, 1906.5 };
+    s.cal[9] = (cal_point_t){ 405.0, 1953.75 };
+    s.cal[10] = (cal_point_t){ 450.0, 2001.0 };
+    s.cal[11] = (cal_point_t){ 495.0, 2055.5 };
+    s.cal[12] = (cal_point_t){ 540.0, 2104.0 };
+    s.cal[13] = (cal_point_t){ 585.0, 2150.0 };
+    s.cal[14] = (cal_point_t){ 630.0, 2197.0 };
+    s.cal[15] = (cal_point_t){ 675.0, 2246.0 };
+    s.cal[16] = (cal_point_t){ 720.0, 2296.0 };
 
     servo_sort_cal(&s);
     if (servo_validate_cal(&s) < 0) {
