@@ -701,3 +701,4 @@ int main(void) {
     puts("Exiting. Disabling PWM.");
     pwm_off();
     return 0;
+}
