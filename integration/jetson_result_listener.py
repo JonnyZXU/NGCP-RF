@@ -7,9 +7,6 @@ This module owns only the Jetson-side communication loop:
   1. Send GPS to the Raspberry Pi.
   2. Wait for the Pi to send back either LOCATION or REPOSITION.
   3. Forward that received message to the appropriate Jetson-side subsystem.
-
-This module does **not** compute triangulation and does **not** control vehicle
-movement directly.
 """
 
 from __future__ import annotations
