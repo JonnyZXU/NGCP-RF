@@ -28,15 +28,7 @@ logging.basicConfig(
 # ── GPS acquisition ─────────────────────────────────────────────────────────
 
 def read_gps_fix() -> dict:
-    """
-    Return the latest GPS fix from the Jetson's onboard GPS hardware.
 
-    Replace the stub below with your actual GPS driver call, e.g. reading
-    from a serial NMEA device, a ROS topic, or a vendor SDK.
-
-    Returns a dict with keys: latitude, longitude, heading, altitude, fix_quality
-    Raises RuntimeError if no valid fix is available.
-    """
     # ── STUB: replace with real GPS driver ──────────────────────────────────
     import random
     fix = {
