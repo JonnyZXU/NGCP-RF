@@ -2,16 +2,6 @@
 jetson_gps_sender.py
 --------------------
 Runs on the **Jetson**.
-
-Reads the current GPS fix and transmits it to the Raspberry Pi over TCP.
-Called once per scan attempt (the retry loop lives in jetson_result_listener.py
-which drives the overall flow on the Jetson side).
-
-Usage (standalone test):
-    python jetson_gps_sender.py
-
-Typical integration:
-    from jetson_gps_sender import send_gps_to_rpi, read_gps_fix
 """
 
 import logging
@@ -53,8 +43,6 @@ def read_gps_fix() -> dict:
         "latitude":    34.0522 + random.uniform(-0.001, 0.001),
         "longitude":  -118.2437 + random.uniform(-0.001, 0.001),
         "heading":     random.uniform(0, 360),
-        "altitude":    80.0,
-        "fix_quality": 1,
     }
     log.info(
         "GPS fix: lat=%.6f lon=%.6f heading=%.1f°",
@@ -89,8 +77,6 @@ def send_gps_to_rpi(
         lat=fix["latitude"],
         lon=fix["longitude"],
         heading=fix["heading"],
-        altitude=fix["altitude"],
-        fix_quality=fix["fix_quality"],
     )
 
     for attempt in range(1, retries + 1):
