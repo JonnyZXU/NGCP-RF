@@ -18,8 +18,8 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 # ── Network defaults (override via environment or pass explicitly) ──────────
-JETSON_HOST = "192.168.1.10"   # Jetson's static IP on the Ethernet link
-RPI_HOST    = "192.168.1.20"   # Raspberry Pi's static IP on the Ethernet link
+JETSON_HOST = "192.168.50.2"   # Jetson's static IP on the Ethernet link
+RPI_HOST    = "192.168.50.1"   # Raspberry Pi's static IP on the Ethernet link
 
 GPS_PORT    = 5100   # RPi listens here for incoming GPS data from the Jetson
 RESULT_PORT = 5101   # Jetson listens here for results / reposition signals
@@ -85,13 +85,13 @@ def make_gps_message(lat: float, lon: float, heading: float,
 
 
 def make_location_message(lat: float, lon: float,
-                          confidence: float = 1.0) -> dict:
+                          heading: float) -> dict:
     """Build a LOCATION result message (survivor's estimated position)."""
     return {
         "type":       MSG_LOCATION,
         "latitude":   lat,
         "longitude":  lon,
-        "confidence": confidence,
+        "heading": heading,
     }
 
 
