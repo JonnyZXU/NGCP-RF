@@ -1,49 +1,39 @@
 """
 rpi_comms.py
 ------------
-Runs on the **Raspberry Pi**.
+Runs on the Raspberry Pi.
 
-This module handles only Raspberry Pi communication responsibilities:
+Two responsibilities running in parallel:
+  1. GPS SERVER (port 5100):
+     Accept GPS from Jetson -> write atomically to jetson_gps.txt
+     so pi_node.py always has the current rover position.
 
-  GpsServer
-      Receives GPS_DATA messages from the Jetson.
-
-  ResultSender
-      Sends the already-computed triangulation result back to the Jetson as
-      either a LOCATION message or a REPOSITION message.
-
-This file does **not** perform triangulation. It assumes another Pi-side
-subsystem already computes the result and hands it to this module.
-
-Typical integration:
-    from rpi_comms import GpsServer, ResultSender
-
-    gps_server = GpsServer()
-    result_sender = ResultSender()
-
-    gps_data = gps_server.receive_gps()  # if your existing system needs it
-
-    triangulation_result = get_existing_triangulation_result()
-    result_sender.send_triangulation_result(triangulation_result)
+  2. RESULT WATCHER:
+     Watch pi_gps.txt for changes written by pi_node.py.
+     Forward every change to the Jetson via TCP (port 5101).
+     - status=0 : intermediate waypoint (rover needs to move here)
+     - status=1 : final target confirmed (mission complete)
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import socket
+import threading
 import time
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from comms_protocol import (
-    CONNECT_TIMEOUT,
     GPS_PORT,
     JETSON_HOST,
     RECV_TIMEOUT,
     RESULT_PORT,
     MSG_ACK,
     MSG_GPS,
-    make_location_message,
-    make_reposition_message,
+    MSG_LOCATION,
+    MSG_REPOSITION,
     recv_message,
     send_message,
 )
@@ -54,220 +44,206 @@ logging.basicConfig(
     format="%(asctime)s [RPI-COMMS] %(levelname)s %(message)s",
 )
 
-
-class GpsServer:
-    """Receive one GPS_DATA message from the Jetson per scan attempt."""
-
-    def __init__(self, port: int = GPS_PORT, timeout: float = RECV_TIMEOUT):
-        self.port = port
-        self.timeout = timeout
-
-    def receive_gps(self) -> Optional[dict[str, Any]]:
-        """
-        Wait for one valid GPS_DATA message.
-
-        Returns the decoded message dictionary, or None on timeout/error.
-        """
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind(("0.0.0.0", self.port))
-            srv.listen(1)
-            srv.settimeout(self.timeout)
-            log.info("GPS server listening on port %d", self.port)
-
-            try:
-                conn, addr = srv.accept()
-                log.info("Jetson connected from %s", addr)
-            except TimeoutError:
-                log.error("Timed out waiting for GPS connection from Jetson")
-                return None
-
-            with conn:
-                conn.settimeout(self.timeout)
-                try:
-                    msg = recv_message(conn)
-                except Exception as exc:
-                    log.error("Error reading GPS message: %s", exc)
-                    return None
-
-                if msg.get("type") != MSG_GPS:
-                    log.warning("Unexpected message type on GPS port: %s", msg.get("type"))
-                    return None
-
-                if not _validate_gps(msg):
-                    log.error("GPS message failed validation: %s", msg)
-                    return None
-
-                send_message(conn, {"type": MSG_ACK})
-                log.info(
-                    "GPS received and ACKed: lat=%.6f lon=%.6f heading=%.1f",
-                    msg["latitude"],
-                    msg["longitude"],
-                    msg["heading"],
-                )
-                return msg
+JETSON_GPS_FILE  = "/home/ngcp2025/rf_integration/jetson_gps.txt"
+PI_GPS_FILE      = "/home/ngcp2025/rf_integration/pi_gps.txt"
+GPS_TIMEOUT_S    = 60.0
+WATCH_INTERVAL_S = 0.25
+SEND_RETRIES     = 3
+SEND_RETRY_DELAY = 2.0
 
 
-class ResultSender:
-    """
-    Send the Pi's already-available triangulation outcome to the Jetson.
-
-    Public options:
-      - send_location(...)
-      - send_reposition(...)
-      - send_triangulation_result(result)
-    """
-
-    def __init__(
-        self,
-        jetson_host: str = JETSON_HOST,
-        result_port: int = RESULT_PORT,
-        retries: int = 3,
-        retry_delay: float = 2.0,
-    ):
-        self.jetson_host = jetson_host
-        self.result_port = result_port
-        self.retries = retries
-        self.retry_delay = retry_delay
-
-    def send_location(self, lat: float, lon: float, confidence: float = 1.0) -> bool:
-        """Send a successful survivor location result to the Jetson."""
-        msg = make_location_message(lat, lon, confidence)
-        log.info("Sending LOCATION to Jetson: lat=%.6f lon=%.6f conf=%.2f", lat, lon, confidence)
-        return self._send(msg)
-
-    def send_reposition(self, reason: str = "Insufficient RF data") -> bool:
-        """Send a retry/reposition signal to the Jetson."""
-        msg = make_reposition_message(reason)
-        log.info("Sending REPOSITION to Jetson: %s", reason)
-        return self._send(msg)
-
-    def send_triangulation_result(self, result: Optional[Mapping[str, Any]]) -> bool:
-        """
-        Send an already-computed triangulation result to the Jetson.
-
-        Accepted success shapes include:
-            {"success": True, "latitude": ..., "longitude": ..., "confidence": ...}
-            {"latitude": ..., "longitude": ..., "confidence": ...}
-            {"lat": ..., "lon": ..., "confidence": ...}
-
-        Accepted failure shapes include:
-            None
-            {"success": False, "reason": "..."}
-            {"reason": "..."}
-
-        Returns True when the Jetson ACKs the delivered message.
-        """
-        normalized = normalize_triangulation_result(result)
-        if normalized["type"] == "success":
-            return self.send_location(
-                normalized["latitude"],
-                normalized["longitude"],
-                normalized["confidence"],
-            )
-        return self.send_reposition(normalized["reason"])
-
-    def _send(self, message: dict[str, Any]) -> bool:
-        for attempt in range(1, self.retries + 1):
-            try:
-                log.info(
-                    "Connecting to Jetson at %s:%d (attempt %d/%d)",
-                    self.jetson_host,
-                    self.result_port,
-                    attempt,
-                    self.retries,
-                )
-                with socket.create_connection(
-                    (self.jetson_host, self.result_port),
-                    timeout=CONNECT_TIMEOUT,
-                ) as sock:
-                    sock.settimeout(RECV_TIMEOUT)
-                    send_message(sock, message)
-                    ack = recv_message(sock)
-                    if ack.get("type") == MSG_ACK:
-                        log.info("Jetson ACKed the result message")
-                        return True
-                    log.warning("Unexpected response after result send: %s", ack)
-            except (ConnectionRefusedError, TimeoutError, OSError) as exc:
-                log.warning("Result send attempt %d failed: %s", attempt, exc)
-                if attempt < self.retries:
-                    time.sleep(self.retry_delay)
-
-        log.error("Failed to deliver result to Jetson after %d attempts", self.retries)
-        return False
-
-
-def normalize_triangulation_result(result: Optional[Mapping[str, Any]]) -> dict[str, Any]:
-    """
-    Convert your existing Pi triangulation output into a communication decision.
-
-    Output shape:
-      success -> {"type": "success", "latitude": float, "longitude": float, "confidence": float}
-      failure -> {"type": "failure", "reason": str}
-    """
-    if result is None:
-        return {"type": "failure", "reason": "Insufficient RF data"}
-
-    success_flag = result.get("success") if isinstance(result, Mapping) else None
-
-    latitude = _first_present(result, "latitude", "lat")
-    longitude = _first_present(result, "longitude", "lon")
-    confidence = result.get("confidence", 1.0) if isinstance(result, Mapping) else 1.0
-    reason = result.get("reason", "Insufficient RF data") if isinstance(result, Mapping) else "Insufficient RF data"
-
-    has_coords = latitude is not None and longitude is not None
-
-    if success_flag is False:
-        return {"type": "failure", "reason": str(reason)}
-
-    if success_flag is True or has_coords:
-        try:
-            return {
-                "type": "success",
-                "latitude": float(latitude),
-                "longitude": float(longitude),
-                "confidence": float(confidence),
-            }
-        except (TypeError, ValueError):
-            return {"type": "failure", "reason": "Triangulation output contained invalid coordinates"}
-
-    return {"type": "failure", "reason": str(reason)}
-
-
-def _first_present(result: Mapping[str, Any], *keys: str) -> Any:
-    for key in keys:
-        if key in result and result[key] is not None:
-            return result[key]
-    return None
+def _write_gps_atomic(gps_msg: Mapping[str, Any], filepath: str) -> None:
+    path = Path(filepath)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        f"latitude: {float(gps_msg['latitude']):.7f}\n"
+        f"longitude: {float(gps_msg['longitude']):.7f}\n"
+        f"heading: {float(gps_msg['heading']):.2f}\n"
+        f"status: {int(gps_msg.get('status', 0))}\n"
+    )
+    tmp = filepath + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, filepath)
+    log.debug("Wrote GPS to %s", filepath)
 
 
 def _validate_gps(msg: Mapping[str, Any]) -> bool:
     try:
-        lat = float(msg["latitude"])
-        lon = float(msg["longitude"])
+        lat     = float(msg["latitude"])
+        lon     = float(msg["longitude"])
         heading = float(msg["heading"])
-        fix_quality = int(msg["fix_quality"])
     except (KeyError, TypeError, ValueError):
         return False
-
-    if not (-90.0 <= lat <= 90.0):
-        return False
-    if not (-180.0 <= lon <= 180.0):
-        return False
-    if not (0.0 <= heading < 360.0):
-        return False
-    if fix_quality < 1:
-        return False
+    if not (-90.0  <= lat     <= 90.0):  return False
+    if not (-180.0 <= lon     <= 180.0): return False
+    if not (-360.0 <= heading <  360.0): return False
     return True
 
 
+def _read_pi_gps(filepath: str = PI_GPS_FILE) -> Optional[dict]:
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except (FileNotFoundError, OSError):
+        return None
+    fields = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        fields[key.strip().lower()] = value.strip()
+    if not all(r in fields for r in ("latitude", "longitude", "heading", "status")):
+        return None
+    try:
+        return {
+            "latitude":  float(fields["latitude"]),
+            "longitude": float(fields["longitude"]),
+            "heading":   float(fields["heading"]),
+            "status":    int(fields["status"]),
+            "raw":       raw,
+        }
+    except (ValueError, KeyError):
+        return None
+
+
+def _send_result_to_jetson(result: dict) -> bool:
+    status = result["status"]
+    if status == 1:
+        message = {
+            "type":      MSG_LOCATION,
+            "latitude":  result["latitude"],
+            "longitude": result["longitude"],
+            "heading":   result["heading"],
+            "status":    1,
+        }
+        label = "LOCATION (target)"
+    else:
+        message = {
+            "type":      MSG_REPOSITION,
+            "latitude":  result["latitude"],
+            "longitude": result["longitude"],
+            "heading":   result["heading"],
+            "status":    0,
+            "reason":    "waypoint",
+        }
+        label = "REPOSITION (waypoint)"
+
+    for attempt in range(1, SEND_RETRIES + 1):
+        try:
+            with socket.create_connection(
+                (JETSON_HOST, RESULT_PORT), timeout=10.0
+            ) as sock:
+                sock.settimeout(RECV_TIMEOUT)
+                send_message(sock, message)
+                ack = recv_message(sock)
+                if ack.get("type") == MSG_ACK:
+                    log.info(
+                        "Sent %s to Jetson: lat=%.7f lon=%.7f heading=%.2f",
+                        label, result["latitude"],
+                        result["longitude"], result["heading"],
+                    )
+                    return True
+                log.warning("Unexpected response from Jetson: %s", ack)
+        except Exception as exc:
+            log.warning("Send attempt %d/%d failed: %s", attempt, SEND_RETRIES, exc)
+            if attempt < SEND_RETRIES:
+                time.sleep(SEND_RETRY_DELAY)
+    log.error("Failed to send result to Jetson after %d attempts", SEND_RETRIES)
+    return False
+
+
+def gps_server_loop():
+    log.info("GPS server thread started on port %d", GPS_PORT)
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("0.0.0.0", GPS_PORT))
+                srv.listen(1)
+                srv.settimeout(GPS_TIMEOUT_S)
+                try:
+                    conn, addr = srv.accept()
+                except TimeoutError:
+                    log.warning("GPS server: timed out waiting for Jetson")
+                    continue
+                with conn:
+                    conn.settimeout(GPS_TIMEOUT_S)
+                    try:
+                        msg = recv_message(conn)
+                    except Exception as exc:
+                        log.error("GPS server: read error: %s", exc)
+                        continue
+                    if msg.get("type") != MSG_GPS:
+                        log.warning("GPS server: unexpected type: %s", msg.get("type"))
+                        continue
+                    if not _validate_gps(msg):
+                        log.error("GPS server: validation failed: %s", msg)
+                        continue
+                    send_message(conn, {"type": MSG_ACK})
+                    log.info(
+                        "GPS received: lat=%.7f lon=%.7f heading=%.2f status=%d",
+                        msg["latitude"], msg["longitude"],
+                        msg["heading"], msg.get("status", 0),
+                    )
+                    _write_gps_atomic(msg, JETSON_GPS_FILE)
+        except Exception as exc:
+            log.error("GPS server loop error: %s — restarting in 2s", exc)
+            time.sleep(2)
+
+
+def result_watcher_loop():
+    log.info("Result watcher thread started — watching %s", PI_GPS_FILE)
+    last_content  = None
+    last_mtime_ns = None
+    while True:
+        try:
+            try:
+                st = os.stat(PI_GPS_FILE)
+            except FileNotFoundError:
+                time.sleep(WATCH_INTERVAL_S)
+                continue
+            if last_mtime_ns is not None and st.st_mtime_ns == last_mtime_ns:
+                time.sleep(WATCH_INTERVAL_S)
+                continue
+            result = _read_pi_gps(PI_GPS_FILE)
+            if result is None:
+                time.sleep(WATCH_INTERVAL_S)
+                continue
+            if result["raw"] == last_content:
+                last_mtime_ns = st.st_mtime_ns
+                time.sleep(WATCH_INTERVAL_S)
+                continue
+            last_content  = result["raw"]
+            last_mtime_ns = st.st_mtime_ns
+            log.info(
+                "pi_gps.txt changed: lat=%.7f lon=%.7f heading=%.2f status=%d",
+                result["latitude"], result["longitude"],
+                result["heading"], result["status"],
+            )
+            _send_result_to_jetson(result)
+        except Exception as exc:
+            log.error("Result watcher error: %s", exc)
+            time.sleep(WATCH_INTERVAL_S)
+
+
 if __name__ == "__main__":
-    # Simple local behavior example. Replace fake_result with your existing
-    # triangulation output object when integrating into the Pi system.
-    sender = ResultSender()
-    fake_result = {
-        "success": False,
-        "reason": "Insufficient RF data",
-    }
-    ok = sender.send_triangulation_result(fake_result)
-    raise SystemExit(0 if ok else 1)
+    log.info("RPI comms starting")
+    log.info("  GPS server    : port %d -> writes %s", GPS_PORT, JETSON_GPS_FILE)
+    log.info("  Result watcher: watching %s -> Jetson port %d", PI_GPS_FILE, RESULT_PORT)
+
+    gps_thread = threading.Thread(target=gps_server_loop, daemon=True, name="gps-server")
+    result_thread = threading.Thread(target=result_watcher_loop, daemon=True, name="result-watcher")
+
+    gps_thread.start()
+    result_thread.start()
+
+    log.info("Both threads running")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("Shutting down")
